@@ -1,25 +1,39 @@
 package com.hmdp.service.impl;
 
 import cn.hutool.core.bean.BeanUtil;
+import cn.hutool.json.JSONObject;
+import com.alibaba.fastjson.JSON;
 import com.baomidou.mybatisplus.extension.service.impl.ServiceImpl;
+import com.fasterxml.jackson.databind.ObjectMapper;
+import com.hmdp.Constants.QueueConstants;
 import com.hmdp.dto.Result;
+import com.hmdp.dto.VoucherObj;
 import com.hmdp.entity.VoucherOrder;
 import com.hmdp.mapper.VoucherOrderMapper;
 import com.hmdp.service.ISeckillVoucherService;
 import com.hmdp.service.IVoucherOrderService;
+import com.hmdp.service.QueueService;
 import com.hmdp.utils.RedisIdWorker;
 import com.hmdp.utils.UserHolder;
+import com.rabbitmq.client.Channel;
 import lombok.extern.slf4j.Slf4j;
 import org.redisson.api.RLock;
 import org.redisson.api.RedissonClient;
+import org.springframework.amqp.core.Message;
+import org.springframework.amqp.rabbit.connection.CorrelationData;
+import org.springframework.amqp.rabbit.core.RabbitTemplate;
+import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.core.io.ClassPathResource;
 import org.springframework.data.redis.connection.stream.*;
 import org.springframework.data.redis.core.StringRedisTemplate;
 import org.springframework.data.redis.core.script.DefaultRedisScript;
 import org.springframework.stereotype.Service;
+import org.springframework.transaction.annotation.Transactional;
 
 import javax.annotation.PostConstruct;
 import javax.annotation.Resource;
+import java.io.IOException;
+import java.lang.reflect.Type;
 import java.time.Duration;
 import java.util.Collections;
 import java.util.List;
@@ -42,21 +56,27 @@ public class VoucherOrderServiceImpl extends ServiceImpl<VoucherOrderMapper, Vou
     @Resource
     private StringRedisTemplate stringRedisTemplate;
 
+    @Autowired
+    private RabbitTemplate rabbitTemplate;
+
+
     private static final DefaultRedisScript<Long> SECKILL_SCRIPT;
+
 
     static {
         SECKILL_SCRIPT = new DefaultRedisScript<>();
         SECKILL_SCRIPT.setLocation(new ClassPathResource("seckill.lua"));
         SECKILL_SCRIPT.setResultType(Long.class);
+
     }
 
 
-    private static final ExecutorService SECKILL_ORDER_EXECUTOR = Executors.newSingleThreadExecutor();
+//    private static final ExecutorService SECKILL_ORDER_EXECUTOR = Executors.newSingleThreadExecutor();
 
-    @PostConstruct
-    private void init() {
-        SECKILL_ORDER_EXECUTOR.submit(new VoucherOrderHandler());
-    }
+//    @PostConstruct
+//    private void init() {
+//        SECKILL_ORDER_EXECUTOR.submit(new VoucherOrderHandler());
+//    }
 
     private class VoucherOrderHandler implements Runnable {
 
@@ -68,7 +88,7 @@ public class VoucherOrderServiceImpl extends ServiceImpl<VoucherOrderMapper, Vou
                     List<MapRecord<String, Object, Object>> list = stringRedisTemplate.opsForStream().read(
                             Consumer.from("g1", "c1"),
                             StreamReadOptions.empty().count(1).block(Duration.ofSeconds(2)),
-                            StreamOffset.create("stream.orders", ReadOffset.lastConsumed())
+                            StreamOffset.create("streams.order", ReadOffset.lastConsumed())
                     );
                     // 2.判断订单信息是否为空
                     if (list == null || list.isEmpty()) {
@@ -82,7 +102,7 @@ public class VoucherOrderServiceImpl extends ServiceImpl<VoucherOrderMapper, Vou
                     // 3.创建订单
                     createVoucherOrder(voucherOrder);
                     // 4.确认消息 XACK
-                    stringRedisTemplate.opsForStream().acknowledge("s1", "g1", record.getId());
+                    stringRedisTemplate.opsForStream().acknowledge("streams.order", "g1", record.getId());
                 } catch (Exception e) {
                     log.error("处理订单异常", e);
                     handlePendingList();
@@ -97,7 +117,7 @@ public class VoucherOrderServiceImpl extends ServiceImpl<VoucherOrderMapper, Vou
                     List<MapRecord<String, Object, Object>> list = stringRedisTemplate.opsForStream().read(
                             Consumer.from("g1", "c1"),
                             StreamReadOptions.empty().count(1),
-                            StreamOffset.create("stream.orders", ReadOffset.from("0"))
+                            StreamOffset.create("streams.order", ReadOffset.from("0"))
                     );
                     // 2.判断订单信息是否为空
                     if (list == null || list.isEmpty()) {
@@ -111,9 +131,15 @@ public class VoucherOrderServiceImpl extends ServiceImpl<VoucherOrderMapper, Vou
                     // 3.创建订单
                     createVoucherOrder(voucherOrder);
                     // 4.确认消息 XACK
-                    stringRedisTemplate.opsForStream().acknowledge("s1", "g1", record.getId());
+                    stringRedisTemplate.opsForStream().acknowledge("streams.order", "g1", record.getId());
                 } catch (Exception e) {
                     log.error("处理订单异常", e);
+
+                    try{
+                        Thread.sleep(20);
+                    } catch (InterruptedException ex) {
+                        ex.printStackTrace();
+                    }
                 }
             }
         }
@@ -137,7 +163,9 @@ public class VoucherOrderServiceImpl extends ServiceImpl<VoucherOrderMapper, Vou
         }
     }*/
 
-    private void createVoucherOrder(VoucherOrder voucherOrder) {
+
+
+    public void createVoucherOrder(VoucherOrder voucherOrder) {
 //        Long userId = voucherOrder.getUserId();
         Long userId = voucherOrder.getUserId();
         Long voucherId = voucherOrder.getVoucherId();
@@ -180,7 +208,9 @@ public class VoucherOrderServiceImpl extends ServiceImpl<VoucherOrderMapper, Vou
         }
     }
 
+
     @Override
+    @Transactional(rollbackFor = {Exception.class})
     public Result seckillVoucher(Long voucherId) {
         Long userId = UserHolder.getUser().getId();
         long orderId = redisIdWorker.nextId("order");
@@ -190,12 +220,46 @@ public class VoucherOrderServiceImpl extends ServiceImpl<VoucherOrderMapper, Vou
                 Collections.emptyList(),
                 voucherId.toString(), userId.toString(), String.valueOf(orderId)
         );
+
         int r = result.intValue();
         // 2.判断结果是否为0
         if (r != 0) {
+
             // 2.1.不为0 ，代表没有购买资格
             return Result.fail(r == 1 ? "库存不足" : "不能重复下单");
         }
+
+        rabbitTemplate.setConfirmCallback(new RabbitTemplate.ConfirmCallback() {
+            @Override
+            public void confirm(CorrelationData correlationData, boolean b, String s) {
+                if (b){
+                    System.out.println("消息发送成功");
+                }else {
+                    Message returnedMessage = correlationData.getReturnedMessage();
+                    String s1 = new String(returnedMessage.getBody());
+                    rabbitTemplate.convertAndSend(QueueConstants.DLX_QUEUE,s1);
+                }
+            }
+        });
+
+
+        rabbitTemplate.setMandatory(true);
+        rabbitTemplate.setReturnCallback(new RabbitTemplate.ReturnCallback() {
+            @Override
+            public void returnedMessage(Message message, int i, String s, String s1, String s2) {
+                System.out.println("Returned Message: " + message);
+                System.out.println("Reply Code: " + i);
+                System.out.println("Reply Text: " + s);
+                System.out.println("Exchange: " + s1);
+                System.out.println("Routing Key: " + s2);
+                String s3 = new String(message.getBody());
+                rabbitTemplate.convertAndSend(QueueConstants.DLX_QUEUE,s3);
+            }
+        });
+
+        VoucherObj obj = new VoucherObj(userId,voucherId,orderId);
+        String s = JSON.toJSONString(obj);
+        rabbitTemplate.convertAndSend(QueueConstants.ORDER_EXCHANGE,"order",s);
         // 3.返回订单id
         return Result.ok(orderId);
     }
@@ -230,6 +294,9 @@ public class VoucherOrderServiceImpl extends ServiceImpl<VoucherOrderMapper, Vou
         // 3.返回订单id
         return Result.ok(orderId);
     }*/
+
+
+
     /*@Override
     public Result seckillVoucher(Long voucherId) {
         // 1.查询优惠券
