@@ -229,33 +229,33 @@ public class VoucherOrderServiceImpl extends ServiceImpl<VoucherOrderMapper, Vou
             return Result.fail(r == 1 ? "库存不足" : "不能重复下单");
         }
 
-        rabbitTemplate.setConfirmCallback(new RabbitTemplate.ConfirmCallback() {
-            @Override
-            public void confirm(CorrelationData correlationData, boolean b, String s) {
-                if (b){
-                    System.out.println("消息发送成功");
-                }else {
-                    Message returnedMessage = correlationData.getReturnedMessage();
-                    String s1 = new String(returnedMessage.getBody());
-                    rabbitTemplate.convertAndSend(QueueConstants.DLX_QUEUE,s1);
-                }
-            }
-        });
-
-
-        rabbitTemplate.setMandatory(true);
-        rabbitTemplate.setReturnCallback(new RabbitTemplate.ReturnCallback() {
-            @Override
-            public void returnedMessage(Message message, int i, String s, String s1, String s2) {
-                System.out.println("Returned Message: " + message);
-                System.out.println("Reply Code: " + i);
-                System.out.println("Reply Text: " + s);
-                System.out.println("Exchange: " + s1);
-                System.out.println("Routing Key: " + s2);
-                String s3 = new String(message.getBody());
-                rabbitTemplate.convertAndSend(QueueConstants.DLX_QUEUE,s3);
-            }
-        });
+//        rabbitTemplate.setConfirmCallback(new RabbitTemplate.ConfirmCallback() {
+//            @Override
+//            public void confirm(CorrelationData correlationData, boolean b, String s) {
+//                if (b){
+//                    System.out.println("消息发送成功");
+//                }else {
+//                    Message returnedMessage = correlationData.getReturnedMessage();
+//                    String s1 = new String(returnedMessage.getBody());
+//                    rabbitTemplate.convertAndSend(QueueConstants.DLX_QUEUE,s1);
+//                }
+//            }
+//        });
+//
+//
+//        rabbitTemplate.setMandatory(true);
+//        rabbitTemplate.setReturnCallback(new RabbitTemplate.ReturnCallback() {
+//            @Override
+//            public void returnedMessage(Message message, int i, String s, String s1, String s2) {
+//                System.out.println("Returned Message: " + message);
+//                System.out.println("Reply Code: " + i);
+//                System.out.println("Reply Text: " + s);
+//                System.out.println("Exchange: " + s1);
+//                System.out.println("Routing Key: " + s2);
+//                String s3 = new String(message.getBody());
+//                rabbitTemplate.convertAndSend(QueueConstants.DLX_QUEUE,s3);
+//            }
+//        });
 
         VoucherObj obj = new VoucherObj(userId,voucherId,orderId);
         String s = JSON.toJSONString(obj);
